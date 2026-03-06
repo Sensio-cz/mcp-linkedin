@@ -1,0 +1,22 @@
+# Virtual environment
+env/
+venv/
+.venv/
+
+# Sessions and credentials
+sessions/
+.env
+*.cookie_key
+
+# Data (sensitive)
+data/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
