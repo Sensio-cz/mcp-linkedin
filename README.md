@@ -40,11 +40,3 @@ Pro Cursor: konfigurace v `.mcp.json` (viz [Sensio OS mcp-linkedin-setup](https:
 | `browse_feed_standalone.py` | Načtení feedu |
 | `create_post_standalone.py` | Zveřejnění příspěvku |
 | `browse_my_posts.py` | Načtení vlastních příspěvků |
-| `get_post_comments_standalone.py` | Načtení komentářů z příspěvku (autor, obsah, reakce, podkomentáře) |
-
-## MCP nástroje (tools)
-
-| Tool | Popis |
-|------|-------|
-| `get_post_comments` | Jednorázové načtení všech komentářů (rozbalí vlákna, load more). Pro každý komentář: autor, obsah, čas, **počet reakcí**, **počet podkomentářů**. Volitelně uloží do `data/comment_tracking/`. |
-| `track_post_comments` | Sledování komentářů s detekcí nových. Ukládá do `data/comment_tracking/`, porovnává s předchozím stavem. |

@@ -10,7 +10,6 @@ sessions/
 
 # Data (sensitive)
 data/*.json
-data/comment_tracking/
 
 # Python
 __pycache__/
