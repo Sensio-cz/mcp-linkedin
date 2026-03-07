@@ -4,6 +4,13 @@ import asyncio
 import sys
 from pathlib import Path
 
+# Windows console encoding fix
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 from linkedin_browser_mcp import get_post_comments
