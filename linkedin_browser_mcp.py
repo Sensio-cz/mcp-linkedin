@@ -816,6 +816,278 @@ async def interact_with_linkedin_post(post_url: str, ctx: Context, action: str =
         
         
 
+def _get_comment_tracking_path():
+    """Get path to the comment tracking data directory"""
+    tracking_dir = Path(__file__).parent / 'data' / 'comment_tracking'
+    tracking_dir.mkdir(parents=True, exist_ok=True)
+    return tracking_dir
+
+
+def _post_url_to_key(post_url: str) -> str:
+    """Convert a post URL to a safe filename key"""
+    import hashlib
+    return hashlib.md5(post_url.encode()).hexdigest()
+
+
+def _load_tracked_comments(post_url: str) -> dict:
+    """Load previously tracked comments for a post"""
+    tracking_dir = _get_comment_tracking_path()
+    key = _post_url_to_key(post_url)
+    tracking_file = tracking_dir / f'{key}.json'
+    if tracking_file.exists():
+        with open(tracking_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"post_url": post_url, "comments": [], "last_checked": None}
+
+
+def _save_tracked_comments(post_url: str, data: dict):
+    """Save tracked comments for a post"""
+    tracking_dir = _get_comment_tracking_path()
+    key = _post_url_to_key(post_url)
+    tracking_file = tracking_dir / f'{key}.json'
+    with open(tracking_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# JavaScript to extract comments from a LinkedIn post page
+EXTRACT_COMMENTS_JS = '''() => {
+    const comments = [];
+    const commentElements = document.querySelectorAll('.comments-comment-item, .comments-comment-entity, [data-id*="comment"]');
+
+    commentElements.forEach(el => {
+        try {
+            // Try multiple selectors for different LinkedIn layouts
+            const authorEl = el.querySelector('.comments-post-meta__name-text, .comments-comment-item__post-meta .hoverable-link-text, a.comments-post-meta__actor-link');
+            const contentEl = el.querySelector('.comments-comment-item__main-content, .comments-comment-item__inline-show-more-text, .feed-shared-main-content');
+            const timeEl = el.querySelector('.comments-comment-item__timestamp, time, .comments-comment-item__post-meta time');
+            const likesEl = el.querySelector('.comments-comment-social-bar__reactions-count, .social-details-social-counts__reactions-count');
+            const profileLinkEl = el.querySelector('a.comments-post-meta__actor-link, a[href*="/in/"]');
+
+            const author = authorEl?.innerText?.trim() || '';
+            const content = contentEl?.innerText?.trim() || '';
+
+            if (author || content) {
+                comments.push({
+                    author: author || 'Unknown',
+                    content: content || '',
+                    timestamp: timeEl?.innerText?.trim() || timeEl?.getAttribute('datetime') || '',
+                    likes: likesEl?.innerText?.trim() || '0',
+                    profileUrl: profileLinkEl?.href || ''
+                });
+            }
+        } catch (e) {
+            // Skip malformed comment elements
+        }
+    });
+
+    return comments;
+}'''
+
+
+@mcp.tool()
+async def get_post_comments(post_url: str, ctx: Context, load_all: bool = True) -> dict:
+    """Fetch all comments from a LinkedIn post (one-time load)
+
+    Args:
+        post_url: LinkedIn post URL
+        ctx: MCP context for logging and progress reporting
+        load_all: If True, try to load all comments by clicking "Load more" (default: True)
+
+    Returns:
+        dict: Contains status, comments array (author, content, timestamp, likes), and count
+    """
+    if not ('linkedin.com/posts/' in post_url or 'linkedin.com/feed/update/' in post_url):
+        return {
+            "status": "error",
+            "message": "Invalid LinkedIn post URL"
+        }
+
+    async with BrowserSession(platform='linkedin', headless=False) as session:
+        try:
+            page = await session.new_page(post_url)
+
+            if 'login' in page.url:
+                return {
+                    "status": "error",
+                    "message": "Not logged in. Please run login_linkedin tool first"
+                }
+
+            # Wait for post to load
+            await page.wait_for_selector('.feed-shared-update-v2', timeout=10000)
+            ctx.info("Post loaded, extracting comments...")
+
+            # Try to expand the comments section
+            try:
+                # Click on the comments count/button to open comments
+                comments_button = await page.query_selector('button[aria-label*="comment"], .social-details-social-counts__comments')
+                if comments_button:
+                    await comments_button.click()
+                    await page.wait_for_timeout(2000)
+            except Exception:
+                pass  # Comments may already be visible
+
+            # Load all comments if requested
+            if load_all:
+                for i in range(20):  # Max 20 "load more" clicks
+                    report_progress(ctx, i, 20, f"Loading more comments (round {i+1})...")
+                    try:
+                        load_more = await page.query_selector('button.comments-comments-list__load-more-comments-button, button[aria-label*="Load more comments"], button[aria-label*="more comments"]')
+                        if load_more and await load_more.is_visible():
+                            await load_more.click()
+                            await page.wait_for_timeout(1500)
+                        else:
+                            break
+                    except Exception:
+                        break
+
+                # Also expand "show previous replies" in threads
+                for _ in range(10):
+                    try:
+                        show_replies = await page.query_selector('button.comments-comments-list__show-previous-button, button[aria-label*="previous replies"]')
+                        if show_replies and await show_replies.is_visible():
+                            await show_replies.click()
+                            await page.wait_for_timeout(1000)
+                        else:
+                            break
+                    except Exception:
+                        break
+
+            # Extract comments
+            comments = await page.evaluate(EXTRACT_COMMENTS_JS)
+
+            await session.save_session(page)
+
+            ctx.info(f"Found {len(comments)} comments")
+
+            return {
+                "status": "success",
+                "post_url": post_url,
+                "comments": comments,
+                "count": len(comments)
+            }
+
+        except Exception as e:
+            ctx.error(f"Failed to fetch comments: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to fetch comments: {str(e)}"
+            }
+
+
+@mcp.tool()
+async def track_post_comments(
+    post_url: str,
+    ctx: Context,
+    auto_refresh: bool = False,
+    interval_seconds: int = 60,
+    max_checks: int = 10
+) -> dict:
+    """Track comments on a LinkedIn post — detect new comments since last check.
+
+    First call loads all comments and saves them. Subsequent calls return only NEW comments.
+    With auto_refresh=True, polls repeatedly at the given interval.
+
+    Args:
+        post_url: LinkedIn post URL
+        ctx: MCP context for logging and progress reporting
+        auto_refresh: If True, automatically re-check for new comments (default: False)
+        interval_seconds: Seconds between checks when auto_refresh=True (default: 60, min: 30)
+        max_checks: Maximum number of auto-refresh checks (default: 10, max: 50)
+
+    Returns:
+        dict: Contains status, new_comments, all_comments, and tracking metadata
+    """
+    if not ('linkedin.com/posts/' in post_url or 'linkedin.com/feed/update/' in post_url):
+        return {
+            "status": "error",
+            "message": "Invalid LinkedIn post URL"
+        }
+
+    interval_seconds = max(30, interval_seconds)
+    max_checks = min(max_checks, 50)
+
+    # Load previous tracking data
+    tracking_data = _load_tracked_comments(post_url)
+    known_comments = tracking_data.get("comments", [])
+    known_keys = {(c.get("author", "") + ":" + c.get("content", "")[:100]) for c in known_comments}
+
+    all_new_comments = []
+    check_count = 0
+    checks_performed = []
+
+    while True:
+        check_count += 1
+        ctx.info(f"Check #{check_count}: Fetching comments from post...")
+
+        # Fetch current comments
+        result = await get_post_comments(post_url, ctx, load_all=True)
+
+        if result.get("status") != "success":
+            return {
+                "status": "error",
+                "message": f"Failed to fetch comments on check #{check_count}: {result.get('message', 'Unknown error')}",
+                "new_comments_so_far": all_new_comments,
+                "checks_performed": check_count
+            }
+
+        current_comments = result.get("comments", [])
+
+        # Find new comments
+        new_in_this_check = []
+        for comment in current_comments:
+            key = comment.get("author", "") + ":" + comment.get("content", "")[:100]
+            if key not in known_keys:
+                new_in_this_check.append(comment)
+                known_keys.add(key)
+                all_new_comments.append(comment)
+
+        checks_performed.append({
+            "check_number": check_count,
+            "timestamp": int(time.time()),
+            "total_comments": len(current_comments),
+            "new_comments": len(new_in_this_check)
+        })
+
+        if new_in_this_check:
+            ctx.info(f"Check #{check_count}: Found {len(new_in_this_check)} new comment(s)!")
+        else:
+            ctx.info(f"Check #{check_count}: No new comments")
+
+        # Update tracking data with all known comments
+        all_known = known_comments + all_new_comments
+        tracking_data = {
+            "post_url": post_url,
+            "comments": all_known,
+            "last_checked": int(time.time()),
+            "total_checks": tracking_data.get("total_checks", 0) + 1
+        }
+        _save_tracked_comments(post_url, tracking_data)
+
+        # If not auto-refreshing, or we've reached max checks, stop
+        if not auto_refresh or check_count >= max_checks:
+            break
+
+        ctx.info(f"Waiting {interval_seconds}s before next check...")
+        await asyncio.sleep(interval_seconds)
+
+    is_first_check = len(known_comments) == 0 and check_count == 1
+
+    return {
+        "status": "success",
+        "post_url": post_url,
+        "is_first_load": is_first_check,
+        "new_comments": all_new_comments,
+        "new_count": len(all_new_comments),
+        "total_tracked": len(tracking_data["comments"]),
+        "checks_performed": checks_performed,
+        "message": (
+            f"Initial load: {len(all_new_comments)} comments saved for tracking."
+            if is_first_check
+            else f"Found {len(all_new_comments)} new comment(s) across {check_count} check(s)."
+        )
+    }
+
+
 if __name__ == "__main__":
     try:
         logger.debug("Starting LinkedIn MCP Server with debug logging")
