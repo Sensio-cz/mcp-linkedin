@@ -2,6 +2,7 @@ from fastmcp import FastMCP, Context
 from playwright.async_api import async_playwright
 import asyncio
 import os
+import re
 import json
 from dotenv import load_dotenv
 from cryptography.fernet import Fernet
@@ -91,8 +92,17 @@ async def save_cookies(page, platform):
         if not setup_sessions_directory():
             raise Exception("Failed to set up sessions directory")
         
-        # Encrypt cookies before saving
-        key = os.getenv('COOKIE_ENCRYPTION_KEY', Fernet.generate_key())
+        # Encrypt cookies before saving (key from .env or .cookie_key)
+        key = os.getenv('COOKIE_ENCRYPTION_KEY')
+        if not key:
+            key_file = Path(__file__).parent / 'sessions' / '.cookie_key'
+            if key_file.exists():
+                key = key_file.read_bytes()
+            else:
+                key = Fernet.generate_key()
+                key_file.write_bytes(key)
+        elif isinstance(key, str):
+            key = key.encode()
         f = Fernet(key)
         encrypted_data = f.encrypt(json.dumps(cookie_data).encode())
         
@@ -108,20 +118,25 @@ async def save_cookies(page, platform):
 # Helper to load cookies
 async def load_cookies(context, platform):
     try:
-        with open(f'sessions/{platform}_cookies.json', 'rb') as f:
+        cookie_file = Path(__file__).parent / 'sessions' / f'{platform}_cookies.json'
+        with open(cookie_file, 'rb') as f:
             encrypted_data = f.read()
             
-        # Decrypt cookies
+        # Decrypt cookies (key from .env or .cookie_key)
         key = os.getenv('COOKIE_ENCRYPTION_KEY')
         if not key:
-            return False
-            
+            key_file = Path(__file__).parent / 'sessions' / '.cookie_key'
+            if not key_file.exists():
+                return False
+            key = key_file.read_bytes()
+        elif isinstance(key, str):
+            key = key.encode()
         f = Fernet(key)
         cookie_data = json.loads(f.decrypt(encrypted_data))
         
-        # Check cookie expiration (24 hours)
-        if int(time.time()) - cookie_data["timestamp"] > 86400:
-            os.remove(f'sessions/{platform}_cookies.json')
+        # Check cookie expiration (7 days)
+        if int(time.time()) - cookie_data["timestamp"] > 604800:
+            os.remove(cookie_file)
             return False
             
         await context.add_cookies(cookie_data["cookies"])
@@ -132,7 +147,7 @@ async def load_cookies(context, platform):
     except Exception as e:
         # If there's any error loading cookies, delete the file and start fresh
         try:
-            os.remove(f'sessions/{platform}_cookies.json')
+            os.remove(Path(__file__).parent / 'sessions' / f'{platform}_cookies.json')
         except:
             pass
         return False
@@ -258,7 +273,7 @@ class BrowserSession:
         page = await self.context.new_page()
         if url:
             try:
-                await page.goto(url, wait_until='networkidle', timeout=30000)
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
             except Exception as e:
                 logger.error(f"Error navigating to {url}: {str(e)}")
                 raise
@@ -743,7 +758,7 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
             
             # Click comments to expand section
             try:
-                comments_trigger = page.locator('button.social-details-social-counts__comments, [class*="comments-count"], .comments-comment-box__form-container ~ button').first
+                comments_trigger = page.locator('button.social-details-social-counts__comments, [class*="comments-count"]').first
                 await comments_trigger.click(timeout=5000)
                 await page.wait_for_timeout(2000)
             except Exception:
@@ -754,33 +769,30 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
             max_iterations = 20
             
             for iteration in range(max_iterations):
-                # Extract comments with reactions and reply count
+                # Extract comments (same logic as final extraction, simplified)
                 batch = await page.evaluate('''() => {
                     const items = [];
-                    const commentEls = document.querySelectorAll('.comments-comment-item, [class*="comment-item"], article[data-id]');
-                    
-                    commentEls.forEach(el => {
-                        const authorEl = el.querySelector('.comments-comment-actor__name, [class*="actor__name"], a[href*="/in/"]');
+                    const commentEls = document.querySelectorAll('.comments-comment-entity, .comments-comment-item, article[data-id]');
+                    const filtered = Array.from(commentEls).filter(el => {
+                        if ((el.className || '').includes('__')) return false;
+                        return !el.classList.contains('comments-comment-entity--reply') && !el.closest('.comments-comment-entity--reply');
+                    });
+                    filtered.forEach(el => {
+                        const authorEl = el.querySelector('.comments-comment-meta__description-title, .comments-comment-actor__name, a[href*="/in/"]');
                         const contentEl = el.querySelector('.comments-comment-item__main-content, [class*="comment-item__content"], .feed-shared-text');
-                        const timeEl = el.querySelector('.comments-comment-item__timestamp, [class*="timestamp"]');
-                        
+                        const timeEl = el.querySelector('time.comments-comment-meta__data, [class*="timestamp"]');
                         let reactions = 0;
-                        const reactionText = el.innerText.match(/(\\d+)\\s*Reaction/i);
-                        if (reactionText) reactions = parseInt(reactionText[1], 10);
-                        
+                        const socialBar = el.querySelector('.comment-social-activity');
+                        if (socialBar) {
+                            const m = socialBar.innerText?.match(/(?:Líbí se|Like)\\s*(\\d+)|(\\d+)\\s*(?:Reaction|Reakce)/i);
+                            if (m) reactions = parseInt(m[1] || m[2], 10);
+                        }
                         let replies = 0;
-                        const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) || el.innerText.match(/(\\d+)\\s+repl/i);
+                        const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) || el.innerText.match(/(\\d+)\\s+repl/i) || el.innerText.match(/Zobrazit\\s+(\\d+)\\s+odpov/i) || el.innerText.match(/(\\d+)\\s+odpov/i);
                         if (replyMatch) replies = parseInt(replyMatch[1], 10);
-                        const replyButtons = el.querySelectorAll('[class*="reply"], button:has-text("Reply")');
-                        if (replies === 0 && el.querySelector('.comments-comment-item--reply, [class*="reply"]')) replies = 1;
-                        
                         const author = authorEl?.innerText?.trim() || 'Unknown';
                         const content = contentEl?.innerText?.trim() || '';
-                        const timestamp = timeEl?.innerText?.trim() || '';
-                        
-                        if (author && content) {
-                            items.push({ author, content, timestamp, reactions, replies });
-                        }
+                        if (content) items.push({ author, content, timestamp: timeEl?.innerText?.trim() || '', reactions, replies });
                     });
                     return items;
                 }''')
@@ -790,7 +802,7 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
                         comments.append(c)
                 
                 # Click "See more comments" or "Load more"
-                load_more = await page.locator('button:has-text("See more"), button:has-text("Load more"), span:has-text("See more comments")').first
+                load_more = page.locator('button:has-text("See more"), button:has-text("Load more"), span:has-text("See more comments")').first
                 try:
                     await load_more.click(timeout=2000)
                     await page.wait_for_timeout(1500)
@@ -801,9 +813,10 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
                     break
                 prev_count = len(comments)
             
-            # Expand reply threads to get accurate reply counts (View 2 replies, Zobrazit 2 odpovědi, etc.)
+            # Expand reply threads - ONLY "View X replies" / "Zobrazit X odpovědí", NOT "Reply"/"Odpovědět" (opens reply form!)
+            view_replies_re = re.compile(r'View\s+\d+\s+repl|Zobrazit\s+\d+\s+odpověd', re.I)
             for _ in range(3):  # Multiple passes - new buttons may appear after expand
-                view_replies = page.locator('button:has-text("View"), button:has-text("Zobrazit"), button:has-text("repl"), button:has-text("odpověd")')
+                view_replies = page.locator('button').filter(has_text=view_replies_re)
                 cnt = await view_replies.count()
                 for i in range(min(cnt, 50)):
                     try:
@@ -818,40 +831,73 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
             comments = await page.evaluate('''() => {
                 const items = [];
                 const seen = new Set();
-                const allCommentEls = document.querySelectorAll('.comments-comment-item, [class*="comment-item"], article[data-id]');
+                const allCommentEls = document.querySelectorAll('.comments-comment-entity, .comments-comment-item, article[data-id]');
                 const topLevel = Array.from(allCommentEls).filter(el => {
-                    const isReply = el.classList.contains('comments-comment-item--reply') ||
-                        el.closest('.comments-comment-item--reply') ||
-                        (el.getAttribute('class') || '').includes('reply');
+                    if ((el.className || '').includes('__')) return false;
+                    const isReply = el.classList.contains('comments-comment-entity--reply') ||
+                        el.classList.contains('comments-comment-item--reply') ||
+                        el.closest('.comments-comment-entity--reply, .comments-comment-item--reply');
                     return !isReply;
                 });
                 
+                function getAuthor(el) {
+                    const title = el.querySelector('.comments-comment-meta__description-title');
+                    if (title && title.innerText?.trim()) return title.innerText.trim();
+                    const selectors = ['.comments-comment-actor__name', '.comments-post-meta__name-text', '[class*="actor__name"]'];
+                    for (const sel of selectors) {
+                        const a = el.querySelector(sel);
+                        if (a && a.innerText?.trim()) return a.innerText.trim();
+                    }
+                    const firstLink = el.querySelector('.comments-comment-meta__actor a[href*="/in/"], a.comments-comment-meta__image-link[href*="/in/"]');
+                    if (firstLink) {
+                        const desc = firstLink.closest('.comments-comment-meta__actor')?.querySelector('.comments-comment-meta__description-title');
+                        if (desc) return desc.innerText?.trim() || '';
+                    }
+                    const profileLinks = el.querySelectorAll('a[href*="/in/"]');
+                    for (const a of profileLinks) {
+                        const t = a.innerText?.trim();
+                        if (t && t.length > 2 && t.length < 80 && !t.includes('\\n') && !/^https?:\\/\\//.test(t))
+                            return t;
+                    }
+                    return '';
+                }
+                
+                function getReactions(el) {
+                    const socialBar = el.querySelector('.comment-social-activity, [class*="comment-social"], [class*="social-activity"]');
+                    if (socialBar) {
+                        const txt = socialBar.innerText || '';
+                        const m = txt.match(/(?:Líbí se|Like)\\s*(\\d+)|(\\d+)\\s*(?:Reaction|Reakce)s?/i);
+                        if (m) return parseInt(m[1] || m[2], 10);
+                    }
+                    const m = el.innerText?.match(/(\\d+)\\s*(?:Reaction|Reakce)s?/i);
+                    if (m) return parseInt(m[1], 10);
+                    return 0;
+                }
+                
                 topLevel.forEach(el => {
-                    const authorEl = el.querySelector('.comments-comment-actor__name, .comments-post-meta__name-text, [class*="actor__name"], a[href*="/in/"]');
-                    const contentEl = el.querySelector('.comments-comment-item__main-content, [class*="comment-item__content"], .feed-shared-text');
-                    const timeEl = el.querySelector('.comments-comment-item__timestamp, [class*="timestamp"]');
-                    
-                    let reactions = 0;
-                    const reactionText = el.innerText.match(/(\\d+)\\s*Reaction/i);
-                    if (reactionText) reactions = parseInt(reactionText[1], 10);
-                    
-                    let replies = 0;
-                    const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) ||
-                        el.innerText.match(/(\\d+)\\s+repl/i) ||
-                        el.innerText.match(/Zobrazit\\s+(\\d+)\\s+odpov/i) ||
-                        el.innerText.match(/(\\d+)\\s+odpov/i);
-                    if (replyMatch) replies = parseInt(replyMatch[1], 10);
-                    const nestedReplies = el.querySelectorAll('.comments-comment-item--reply, [class*="comment-item--reply"]');
-                    if (nestedReplies.length > 0) replies = Math.max(replies, nestedReplies.length);
-                    
-                    const author = authorEl?.innerText?.trim() || 'Unknown';
+                    const author = getAuthor(el) || 'Unknown';
+                    const contentEl = el.querySelector('.comments-comment-item__main-content, .comments-comment-entity__content [class*="main-content"], [class*="comment-item__content"], .feed-shared-text');
                     const content = contentEl?.innerText?.trim() || '';
+                    const timeEl = el.querySelector('time.comments-comment-meta__data, .comments-comment-item__timestamp, [class*="timestamp"]');
                     const timestamp = timeEl?.innerText?.trim() || '';
+                    const reactions = getReactions(el);
+                    
+                    const replyEls = el.querySelectorAll('.comments-comment-entity--reply, .comments-comment-item--reply');
+                    const repliesData = [];
+                    replyEls.forEach(replyEl => {
+                        const rAuthor = getAuthor(replyEl) || 'Unknown';
+                        const rContentEl = replyEl.querySelector('.comments-comment-item__main-content, .comments-comment-entity__content [class*="main-content"], [class*="comment-item__content"], .feed-shared-text');
+                        const rContent = rContentEl?.innerText?.trim() || '';
+                        const rTimeEl = replyEl.querySelector('time.comments-comment-meta__data, [class*="timestamp"]');
+                        const rTimestamp = rTimeEl?.innerText?.trim() || '';
+                        const rReactions = getReactions(replyEl);
+                        if (rContent) repliesData.push({ author: rAuthor, content: rContent, timestamp: rTimestamp, reactions: rReactions });
+                    });
                     
                     const key = author + '|' + content.substring(0, 50);
-                    if (author && content && !seen.has(key)) {
+                    if (content && !seen.has(key)) {
                         seen.add(key);
-                        items.push({ author, content, timestamp, reactions, replies });
+                        items.push({ author, content, timestamp, reactions, replies: repliesData.length, replies_data: repliesData });
                     }
                 });
                 return items;
