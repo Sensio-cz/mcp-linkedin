@@ -722,7 +722,7 @@ async def get_profile_posts(profile_url: str, ctx: Context, count: int = 10) -> 
 
 
 @mcp.tool()
-async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = False) -> dict:
+async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = False, load_all: bool = True) -> dict:
     """Load all comments from a LinkedIn post. Expands threads, clicks 'load more', extracts author, content, timestamp, likes/reactions count, and reply count for each comment.
     Optionally saves to data/comment_tracking/ as JSON."""
     if not ('linkedin.com/posts/' in post_url or 'linkedin.com/feed/update/' in post_url):
@@ -801,26 +801,33 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
                     break
                 prev_count = len(comments)
             
-            # Expand reply threads to get accurate reply counts
-            view_replies = page.locator('button:has-text("View")')
-            reply_count = await view_replies.count()
-            for i in range(min(reply_count, 50)):
-                try:
-                    btn = view_replies.nth(i)
-                    if await btn.is_visible():
-                        await btn.click()
-                        await page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+            # Expand reply threads to get accurate reply counts (View 2 replies, Zobrazit 2 odpovědi, etc.)
+            for _ in range(3):  # Multiple passes - new buttons may appear after expand
+                view_replies = page.locator('button:has-text("View"), button:has-text("Zobrazit"), button:has-text("repl"), button:has-text("odpověd")')
+                cnt = await view_replies.count()
+                for i in range(min(cnt, 50)):
+                    try:
+                        btn = view_replies.nth(i)
+                        if await btn.is_visible():
+                            await btn.click()
+                            await page.wait_for_timeout(1200)
+                    except Exception:
+                        pass
             
-            # Final extraction with updated reply counts
+            # Final extraction: only TOP-LEVEL comments, with reply count from "View X replies" or nested elements
             comments = await page.evaluate('''() => {
                 const items = [];
                 const seen = new Set();
-                const commentEls = document.querySelectorAll('.comments-comment-item, [class*="comment-item"], article[data-id]');
+                const allCommentEls = document.querySelectorAll('.comments-comment-item, [class*="comment-item"], article[data-id]');
+                const topLevel = Array.from(allCommentEls).filter(el => {
+                    const isReply = el.classList.contains('comments-comment-item--reply') ||
+                        el.closest('.comments-comment-item--reply') ||
+                        (el.getAttribute('class') || '').includes('reply');
+                    return !isReply;
+                });
                 
-                commentEls.forEach(el => {
-                    const authorEl = el.querySelector('.comments-comment-actor__name, [class*="actor__name"], a[href*="/in/"]');
+                topLevel.forEach(el => {
+                    const authorEl = el.querySelector('.comments-comment-actor__name, .comments-post-meta__name-text, [class*="actor__name"], a[href*="/in/"]');
                     const contentEl = el.querySelector('.comments-comment-item__main-content, [class*="comment-item__content"], .feed-shared-text');
                     const timeEl = el.querySelector('.comments-comment-item__timestamp, [class*="timestamp"]');
                     
@@ -829,10 +836,13 @@ async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = Fa
                     if (reactionText) reactions = parseInt(reactionText[1], 10);
                     
                     let replies = 0;
-                    const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) || el.innerText.match(/(\\d+)\\s+repl/i);
+                    const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) ||
+                        el.innerText.match(/(\\d+)\\s+repl/i) ||
+                        el.innerText.match(/Zobrazit\\s+(\\d+)\\s+odpov/i) ||
+                        el.innerText.match(/(\\d+)\\s+odpov/i);
                     if (replyMatch) replies = parseInt(replyMatch[1], 10);
-                    const nestedReplies = el.querySelectorAll('.comments-comment-item--reply, [class*="comment-item"][class*="reply"]');
-                    if (replies === 0 && nestedReplies.length > 0) replies = nestedReplies.length;
+                    const nestedReplies = el.querySelectorAll('.comments-comment-item--reply, [class*="comment-item--reply"]');
+                    if (nestedReplies.length > 0) replies = Math.max(replies, nestedReplies.length);
                     
                     const author = authorEl?.innerText?.trim() || 'Unknown';
                     const content = contentEl?.innerText?.trim() || '';
@@ -1042,131 +1052,6 @@ def _save_tracked_comments(post_url: str, data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# JavaScript to extract comments from a LinkedIn post page
-EXTRACT_COMMENTS_JS = '''() => {
-    const comments = [];
-    const commentElements = document.querySelectorAll('.comments-comment-item, .comments-comment-entity, [data-id*="comment"]');
-
-    commentElements.forEach(el => {
-        try {
-            // Try multiple selectors for different LinkedIn layouts
-            const authorEl = el.querySelector('.comments-post-meta__name-text, .comments-comment-item__post-meta .hoverable-link-text, a.comments-post-meta__actor-link');
-            const contentEl = el.querySelector('.comments-comment-item__main-content, .comments-comment-item__inline-show-more-text, .feed-shared-main-content');
-            const timeEl = el.querySelector('.comments-comment-item__timestamp, time, .comments-comment-item__post-meta time');
-            const likesEl = el.querySelector('.comments-comment-social-bar__reactions-count, .social-details-social-counts__reactions-count');
-            const profileLinkEl = el.querySelector('a.comments-post-meta__actor-link, a[href*="/in/"]');
-
-            const author = authorEl?.innerText?.trim() || '';
-            const content = contentEl?.innerText?.trim() || '';
-
-            if (author || content) {
-                comments.push({
-                    author: author || 'Unknown',
-                    content: content || '',
-                    timestamp: timeEl?.innerText?.trim() || timeEl?.getAttribute('datetime') || '',
-                    likes: likesEl?.innerText?.trim() || '0',
-                    profileUrl: profileLinkEl?.href || ''
-                });
-            }
-        } catch (e) {
-            // Skip malformed comment elements
-        }
-    });
-
-    return comments;
-}'''
-
-
-@mcp.tool()
-async def get_post_comments(post_url: str, ctx: Context, load_all: bool = True) -> dict:
-    """Fetch all comments from a LinkedIn post (one-time load)
-
-    Args:
-        post_url: LinkedIn post URL
-        ctx: MCP context for logging and progress reporting
-        load_all: If True, try to load all comments by clicking "Load more" (default: True)
-
-    Returns:
-        dict: Contains status, comments array (author, content, timestamp, likes), and count
-    """
-    if not ('linkedin.com/posts/' in post_url or 'linkedin.com/feed/update/' in post_url):
-        return {
-            "status": "error",
-            "message": "Invalid LinkedIn post URL"
-        }
-
-    async with BrowserSession(platform='linkedin', headless=False) as session:
-        try:
-            page = await session.new_page(post_url)
-
-            if 'login' in page.url:
-                return {
-                    "status": "error",
-                    "message": "Not logged in. Please run login_linkedin tool first"
-                }
-
-            # Wait for post to load
-            await page.wait_for_selector('.feed-shared-update-v2', timeout=10000)
-            ctx.info("Post loaded, extracting comments...")
-
-            # Try to expand the comments section
-            try:
-                # Click on the comments count/button to open comments
-                comments_button = await page.query_selector('button[aria-label*="comment"], .social-details-social-counts__comments')
-                if comments_button:
-                    await comments_button.click()
-                    await page.wait_for_timeout(2000)
-            except Exception:
-                pass  # Comments may already be visible
-
-            # Load all comments if requested
-            if load_all:
-                for i in range(20):  # Max 20 "load more" clicks
-                    report_progress(ctx, i, 20, f"Loading more comments (round {i+1})...")
-                    try:
-                        load_more = await page.query_selector('button.comments-comments-list__load-more-comments-button, button[aria-label*="Load more comments"], button[aria-label*="more comments"]')
-                        if load_more and await load_more.is_visible():
-                            await load_more.click()
-                            await page.wait_for_timeout(1500)
-                        else:
-                            break
-                    except Exception:
-                        break
-
-                # Also expand "show previous replies" in threads
-                for _ in range(10):
-                    try:
-                        show_replies = await page.query_selector('button.comments-comments-list__show-previous-button, button[aria-label*="previous replies"]')
-                        if show_replies and await show_replies.is_visible():
-                            await show_replies.click()
-                            await page.wait_for_timeout(1000)
-                        else:
-                            break
-                    except Exception:
-                        break
-
-            # Extract comments
-            comments = await page.evaluate(EXTRACT_COMMENTS_JS)
-
-            await session.save_session(page)
-
-            ctx.info(f"Found {len(comments)} comments")
-
-            return {
-                "status": "success",
-                "post_url": post_url,
-                "comments": comments,
-                "count": len(comments)
-            }
-
-        except Exception as e:
-            ctx.error(f"Failed to fetch comments: {str(e)}")
-            return {
-                "status": "error",
-                "message": f"Failed to fetch comments: {str(e)}"
-            }
-
-
 @mcp.tool()
 async def track_post_comments(
     post_url: str,
@@ -1213,7 +1098,7 @@ async def track_post_comments(
         ctx.info(f"Check #{check_count}: Fetching comments from post...")
 
         # Fetch current comments
-        result = await get_post_comments(post_url, ctx, load_all=True)
+        result = await get_post_comments(post_url, ctx, save_to_file=False)
 
         if result.get("status") != "success":
             return {
