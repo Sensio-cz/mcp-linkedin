@@ -722,6 +722,199 @@ async def get_profile_posts(profile_url: str, ctx: Context, count: int = 10) -> 
 
 
 @mcp.tool()
+async def get_post_comments(post_url: str, ctx: Context, save_to_file: bool = False) -> dict:
+    """Load all comments from a LinkedIn post. Expands threads, clicks 'load more', extracts author, content, timestamp, likes/reactions count, and reply count for each comment.
+    Optionally saves to data/comment_tracking/ as JSON."""
+    if not ('linkedin.com/posts/' in post_url or 'linkedin.com/feed/update/' in post_url):
+        return {"status": "error", "message": "Invalid LinkedIn post URL"}
+    
+    # Normalize URL (strip comment/reply query params for consistent loading)
+    base_url = post_url.split('?')[0].rstrip('/')
+    
+    async with BrowserSession(platform='linkedin', headless=False) as session:
+        try:
+            page = await session.new_page(base_url)
+            
+            if 'login' in page.url:
+                return {"status": "error", "message": "Not logged in. Please run login_linkedin tool first"}
+            
+            await page.wait_for_selector('.feed-shared-update-v2', timeout=60000)
+            ctx.info("Post loaded, expanding comments...")
+            
+            # Click comments to expand section
+            try:
+                comments_trigger = page.locator('button.social-details-social-counts__comments, [class*="comments-count"], .comments-comment-box__form-container ~ button').first
+                await comments_trigger.click(timeout=5000)
+                await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+            
+            comments = []
+            prev_count = 0
+            max_iterations = 20
+            
+            for iteration in range(max_iterations):
+                # Extract comments with reactions and reply count
+                batch = await page.evaluate('''() => {
+                    const items = [];
+                    const commentEls = document.querySelectorAll('.comments-comment-item, [class*="comment-item"], article[data-id]');
+                    
+                    commentEls.forEach(el => {
+                        const authorEl = el.querySelector('.comments-comment-actor__name, [class*="actor__name"], a[href*="/in/"]');
+                        const contentEl = el.querySelector('.comments-comment-item__main-content, [class*="comment-item__content"], .feed-shared-text');
+                        const timeEl = el.querySelector('.comments-comment-item__timestamp, [class*="timestamp"]');
+                        
+                        let reactions = 0;
+                        const reactionText = el.innerText.match(/(\\d+)\\s*Reaction/i);
+                        if (reactionText) reactions = parseInt(reactionText[1], 10);
+                        
+                        let replies = 0;
+                        const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) || el.innerText.match(/(\\d+)\\s+repl/i);
+                        if (replyMatch) replies = parseInt(replyMatch[1], 10);
+                        const replyButtons = el.querySelectorAll('[class*="reply"], button:has-text("Reply")');
+                        if (replies === 0 && el.querySelector('.comments-comment-item--reply, [class*="reply"]')) replies = 1;
+                        
+                        const author = authorEl?.innerText?.trim() || 'Unknown';
+                        const content = contentEl?.innerText?.trim() || '';
+                        const timestamp = timeEl?.innerText?.trim() || '';
+                        
+                        if (author && content) {
+                            items.push({ author, content, timestamp, reactions, replies });
+                        }
+                    });
+                    return items;
+                }''')
+                
+                for c in batch:
+                    if not any(x.get('content') == c.get('content') and x.get('author') == c.get('author') for x in comments):
+                        comments.append(c)
+                
+                # Click "See more comments" or "Load more"
+                load_more = await page.locator('button:has-text("See more"), button:has-text("Load more"), span:has-text("See more comments")').first
+                try:
+                    await load_more.click(timeout=2000)
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    break
+                
+                if len(comments) == prev_count:
+                    break
+                prev_count = len(comments)
+            
+            # Expand reply threads to get accurate reply counts
+            view_replies = page.locator('button:has-text("View")')
+            reply_count = await view_replies.count()
+            for i in range(min(reply_count, 50)):
+                try:
+                    btn = view_replies.nth(i)
+                    if await btn.is_visible():
+                        await btn.click()
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+            
+            # Final extraction with updated reply counts
+            comments = await page.evaluate('''() => {
+                const items = [];
+                const seen = new Set();
+                const commentEls = document.querySelectorAll('.comments-comment-item, [class*="comment-item"], article[data-id]');
+                
+                commentEls.forEach(el => {
+                    const authorEl = el.querySelector('.comments-comment-actor__name, [class*="actor__name"], a[href*="/in/"]');
+                    const contentEl = el.querySelector('.comments-comment-item__main-content, [class*="comment-item__content"], .feed-shared-text');
+                    const timeEl = el.querySelector('.comments-comment-item__timestamp, [class*="timestamp"]');
+                    
+                    let reactions = 0;
+                    const reactionText = el.innerText.match(/(\\d+)\\s*Reaction/i);
+                    if (reactionText) reactions = parseInt(reactionText[1], 10);
+                    
+                    let replies = 0;
+                    const replyMatch = el.innerText.match(/View\\s+(\\d+)\\s+repl/i) || el.innerText.match(/(\\d+)\\s+repl/i);
+                    if (replyMatch) replies = parseInt(replyMatch[1], 10);
+                    const nestedReplies = el.querySelectorAll('.comments-comment-item--reply, [class*="comment-item"][class*="reply"]');
+                    if (replies === 0 && nestedReplies.length > 0) replies = nestedReplies.length;
+                    
+                    const author = authorEl?.innerText?.trim() || 'Unknown';
+                    const content = contentEl?.innerText?.trim() || '';
+                    const timestamp = timeEl?.innerText?.trim() || '';
+                    
+                    const key = author + '|' + content.substring(0, 50);
+                    if (author && content && !seen.has(key)) {
+                        seen.add(key);
+                        items.push({ author, content, timestamp, reactions, replies });
+                    }
+                });
+                return items;
+            }''')
+            
+            await session.save_session(page)
+            
+            result = {
+                "status": "success",
+                "post_url": base_url,
+                "comments": comments,
+                "count": len(comments)
+            }
+            
+            if save_to_file:
+                tracking_dir = Path(__file__).parent / 'data' / 'comment_tracking'
+                tracking_dir.mkdir(parents=True, exist_ok=True)
+                activity_id = base_url.split('activity:')[-1].rstrip('/')
+                filename = tracking_dir / f"comments_{activity_id}.json"
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        "post_url": base_url,
+                        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "comments": comments,
+                        "count": len(comments)
+                    }, f, ensure_ascii=False, indent=2)
+                result["saved_to"] = str(filename)
+            
+            return result
+            
+        except Exception as e:
+            ctx.error(f"Failed to get comments: {str(e)}")
+            return {"status": "error", "message": f"Failed to get comments: {str(e)}"}
+
+
+@mcp.tool()
+async def track_post_comments(post_url: str, ctx: Context, poll_interval_seconds: int = 300, save_to_file: bool = True) -> dict:
+    """Track comments on a LinkedIn post. Fetches comments, saves to data/comment_tracking/, detects new comments since last run.
+    For continuous polling, run repeatedly (e.g. via cron) or call with desired poll_interval_seconds.
+    Returns current comments plus new_comments list if previous state existed."""
+    result = await get_post_comments(post_url, ctx, save_to_file=save_to_file)
+    if result.get("status") != "success":
+        return result
+    
+    tracking_dir = Path(__file__).parent / 'data' / 'comment_tracking'
+    base_url = post_url.split('?')[0].rstrip('/')
+    activity_id = base_url.split('activity:')[-1].rstrip('/')
+    filename = tracking_dir / f"comments_{activity_id}.json"
+    
+    prev_path = tracking_dir / f"comments_{activity_id}_prev.json"
+    new_comments = []
+    if prev_path.exists():
+        try:
+            with open(prev_path, 'r', encoding='utf-8') as f:
+                prev = json.load(f)
+            prev_keys = {f"{c.get('author','')}|{c.get('content','')[:80]}" for c in prev.get("comments", [])}
+            for c in result.get("comments", []):
+                key = f"{c.get('author','')}|{c.get('content','')[:80]}"
+                if key not in prev_keys:
+                    new_comments.append(c)
+        except Exception:
+            pass
+    
+    if save_to_file and filename.exists():
+        import shutil
+        shutil.copy(filename, prev_path)
+    
+    result["new_comments_count"] = len(new_comments)
+    result["new_comments"] = new_comments
+    return result
+
+
+@mcp.tool()
 async def interact_with_linkedin_post(post_url: str, ctx: Context, action: str = "like", comment: str = None) -> dict:
     """Interact with a LinkedIn post (like, comment)"""
     if not ('linkedin.com/posts/' in post_url or 'linkedin.com/feed/update/' in post_url):
