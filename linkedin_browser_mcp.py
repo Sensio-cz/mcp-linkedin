@@ -1212,6 +1212,496 @@ async def track_post_comments(
     }
 
 
+@mcp.tool()
+async def get_profile_viewers(ctx: Context, count: int = 20) -> dict:
+    """Get list of people who recently viewed your LinkedIn profile.
+
+    Args:
+        ctx: MCP context for logging and progress reporting
+        count: Maximum number of viewers to retrieve (default: 20)
+
+    Returns:
+        dict: Contains status and viewers array with name, headline, profileUrl, timestamp, connectionDegree
+    """
+    async with BrowserSession(platform='linkedin') as session:
+        try:
+            page = await session.new_page('https://www.linkedin.com/me/profile-views/')
+
+            # Check if we're logged in
+            if 'login' in page.url:
+                return {
+                    "status": "error",
+                    "message": "Not logged in. Please run login_linkedin tool first"
+                }
+
+            ctx.info("Loading profile viewers page...")
+            report_progress(ctx, 20, 100, "Waiting for viewers to load...")
+
+            # Wait for the viewers list to appear
+            await page.wait_for_timeout(3000)
+
+            # Try multiple selectors for the viewers list
+            viewers_selectors = [
+                '.profile-views__list-item',
+                '.artdeco-list__item',
+                'li.pvs-list__item--line-separated',
+                '.entity-result__item',
+                'li[class*="profile-view"]',
+                'div[class*="profile-view"] li',
+            ]
+
+            viewers_found = False
+            for selector in viewers_selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=5000)
+                    viewers_found = True
+                    ctx.info(f"Found viewers using selector: {selector}")
+                    break
+                except Exception:
+                    continue
+
+            if not viewers_found:
+                ctx.info("Trying to extract viewers from page content...")
+
+            report_progress(ctx, 50, 100, "Extracting viewer data...")
+
+            # Extract viewer data using comprehensive JS evaluation
+            viewers = await page.evaluate('''(maxCount) => {
+                const viewers = [];
+
+                // Try multiple approaches to find viewer entries
+                const listItems = document.querySelectorAll(
+                    '.profile-views__list-item, ' +
+                    '.artdeco-list__item, ' +
+                    'li.pvs-list__item--line-separated, ' +
+                    '.entity-result__item, ' +
+                    'li[class*="profile-view"], ' +
+                    'div[data-view-name="profile-views-list"] li'
+                );
+
+                for (let i = 0; i < Math.min(listItems.length, maxCount); i++) {
+                    const item = listItems[i];
+                    try {
+                        // Extract name - try multiple selectors
+                        const nameEl = item.querySelector(
+                            'a[href*="/in/"] span, ' +
+                            '.entity-result__title-text a span, ' +
+                            '.artdeco-entity-lockup__title span, ' +
+                            '.profile-views__viewer-name, ' +
+                            'span[aria-hidden="true"]'
+                        );
+                        const name = nameEl ? nameEl.innerText.trim() : '';
+
+                        // Skip if no name found (likely not a viewer entry)
+                        if (!name) continue;
+
+                        // Extract headline
+                        const headlineEl = item.querySelector(
+                            '.entity-result__primary-subtitle, ' +
+                            '.artdeco-entity-lockup__subtitle, ' +
+                            '.profile-views__viewer-headline, ' +
+                            'div[class*="subtitle"], ' +
+                            'p[class*="subtitle"]'
+                        );
+                        const headline = headlineEl ? headlineEl.innerText.trim() : '';
+
+                        // Extract profile URL
+                        const linkEl = item.querySelector('a[href*="/in/"]');
+                        const profileUrl = linkEl ? linkEl.href.split('?')[0] : '';
+
+                        // Extract timestamp
+                        const timeEl = item.querySelector(
+                            'time, ' +
+                            '.profile-views__view-date, ' +
+                            '.artdeco-entity-lockup__metadata, ' +
+                            'span[class*="time"], ' +
+                            'span[class*="date"]'
+                        );
+                        const timestamp = timeEl ? timeEl.innerText.trim() : '';
+
+                        // Extract connection degree
+                        const degreeEl = item.querySelector(
+                            '.dist-value, ' +
+                            '.entity-result__badge-text, ' +
+                            'span[class*="degree"], ' +
+                            'span[class*="distance"]'
+                        );
+                        const connectionDegree = degreeEl ? degreeEl.innerText.trim() : '';
+
+                        // Check for connect button presence (indicates not connected)
+                        const connectBtn = item.querySelector(
+                            'button[aria-label*="Connect"], ' +
+                            'button[aria-label*="Spojit"], ' +
+                            'button[aria-label*="connect"]'
+                        );
+                        const hasConnectButton = !!connectBtn;
+
+                        viewers.push({
+                            name,
+                            headline,
+                            profileUrl,
+                            timestamp,
+                            connectionDegree,
+                            hasConnectButton
+                        });
+                    } catch (e) {
+                        // Skip this item on error
+                    }
+                }
+
+                return viewers;
+            }''', count)
+
+            # If direct extraction found nothing, try scrolling and re-extracting
+            if not viewers:
+                ctx.info("No viewers found with initial selectors, scrolling page...")
+                for _ in range(3):
+                    await page.evaluate('window.scrollBy(0, 600)')
+                    await page.wait_for_timeout(1500)
+
+                # Try a broader extraction approach
+                viewers = await page.evaluate('''(maxCount) => {
+                    const viewers = [];
+                    // Find all links that point to LinkedIn profiles
+                    const profileLinks = document.querySelectorAll('a[href*="/in/"]');
+                    const seen = new Set();
+
+                    for (const link of profileLinks) {
+                        if (viewers.length >= maxCount) break;
+
+                        const url = link.href.split('?')[0];
+                        if (seen.has(url)) continue;
+                        seen.add(url);
+
+                        // Get the parent container
+                        const container = link.closest('li, div[class*="list"], div[class*="item"]');
+                        if (!container) continue;
+
+                        const name = link.querySelector('span[aria-hidden="true"], span')?.innerText?.trim() || link.innerText.trim();
+                        if (!name || name.length < 2) continue;
+
+                        const subtitleEl = container.querySelector(
+                            'p, span[class*="subtitle"], div[class*="subtitle"]'
+                        );
+                        // Skip if the subtitle looks like navigation
+                        const headline = subtitleEl ? subtitleEl.innerText.trim() : '';
+
+                        viewers.push({
+                            name,
+                            headline,
+                            profileUrl: url,
+                            timestamp: '',
+                            connectionDegree: '',
+                            hasConnectButton: false
+                        });
+                    }
+
+                    return viewers;
+                }''', count)
+
+            report_progress(ctx, 90, 100, "Saving session...")
+            await session.save_session(page)
+            report_progress(ctx, 100, 100, "Done")
+
+            return {
+                "status": "success",
+                "viewers": viewers,
+                "count": len(viewers)
+            }
+
+        except Exception as e:
+            ctx.error(f"Failed to get profile viewers: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to get profile viewers: {str(e)}"
+            }
+
+
+@mcp.tool()
+async def send_connection_request(profile_url: str, ctx: Context, note: str | None = None) -> dict:
+    """Send a connection request to a LinkedIn profile.
+
+    Args:
+        profile_url: LinkedIn profile URL (e.g. https://www.linkedin.com/in/username)
+        ctx: MCP context for logging and progress reporting
+        note: Optional personalized note to include with the request (max 300 chars)
+
+    Returns:
+        dict: Contains status and message about the connection request result
+    """
+    if 'linkedin.com/in/' not in profile_url:
+        return {
+            "status": "error",
+            "message": "Invalid LinkedIn profile URL. Should contain 'linkedin.com/in/'"
+        }
+
+    if note and len(note) > 300:
+        return {
+            "status": "error",
+            "message": "Connection note must be 300 characters or less"
+        }
+
+    async with BrowserSession(platform='linkedin') as session:
+        try:
+            page = await session.new_page(profile_url)
+
+            # Check if we're logged in
+            if 'login' in page.url:
+                return {
+                    "status": "error",
+                    "message": "Not logged in. Please run login_linkedin tool first"
+                }
+
+            ctx.info(f"Visiting profile: {profile_url}")
+            report_progress(ctx, 20, 100, "Loading profile...")
+
+            # Wait for profile to load
+            await page.wait_for_timeout(3000)
+
+            # Try to find and click the Connect button
+            connect_selectors = [
+                'button.pv-s-profile-actions--connect',
+                'button[aria-label*="Connect"]',
+                'button[aria-label*="Spojit"]',
+                'button[aria-label*="connect"]',
+                'div.pv-top-card-v2-ctas button[aria-label*="Connect"]',
+                'div.pv-top-card-v2-ctas button[aria-label*="Spojit"]',
+            ]
+
+            connect_clicked = False
+            for selector in connect_selectors:
+                try:
+                    btn = await page.wait_for_selector(selector, timeout=3000)
+                    if btn:
+                        await btn.click()
+                        connect_clicked = True
+                        ctx.info("Clicked Connect button")
+                        break
+                except Exception:
+                    continue
+
+            # If direct Connect button not found, try the "More" menu
+            if not connect_clicked:
+                ctx.info("Connect button not directly visible, trying More menu...")
+                more_selectors = [
+                    'button[aria-label*="More actions"]',
+                    'button[aria-label*="Další"]',
+                    'button[aria-label*="more"]',
+                    'div.pv-top-card-v2-ctas button.artdeco-dropdown__trigger',
+                ]
+                for selector in more_selectors:
+                    try:
+                        more_btn = await page.wait_for_selector(selector, timeout=3000)
+                        if more_btn:
+                            await more_btn.click()
+                            await page.wait_for_timeout(1000)
+
+                            # Now look for Connect in the dropdown
+                            dropdown_connect_selectors = [
+                                'div[class*="dropdown"] span:text-is("Connect")',
+                                'div[class*="dropdown"] span:text-is("Spojit se")',
+                                'li.artdeco-dropdown__item span:text-is("Connect")',
+                                'li.artdeco-dropdown__item span:text-is("Spojit se")',
+                            ]
+                            for dc_selector in dropdown_connect_selectors:
+                                try:
+                                    dc_btn = await page.wait_for_selector(dc_selector, timeout=2000)
+                                    if dc_btn:
+                                        await dc_btn.click()
+                                        connect_clicked = True
+                                        ctx.info("Clicked Connect from More menu")
+                                        break
+                                except Exception:
+                                    continue
+                            if connect_clicked:
+                                break
+                    except Exception:
+                        continue
+
+            if not connect_clicked:
+                await session.save_session(page)
+                return {
+                    "status": "error",
+                    "message": "Could not find Connect button. The person may already be a connection or the profile layout is different."
+                }
+
+            report_progress(ctx, 50, 100, "Processing connection request...")
+            await page.wait_for_timeout(2000)
+
+            # Handle the "How do you know" modal or "Add a note" dialog
+            if note:
+                # Try to click "Add a note" button
+                add_note_selectors = [
+                    'button[aria-label*="Add a note"]',
+                    'button[aria-label*="Přidat poznámku"]',
+                    'button:text-is("Add a note")',
+                    'button:text-is("Přidat poznámku")',
+                ]
+                note_added = False
+                for selector in add_note_selectors:
+                    try:
+                        note_btn = await page.wait_for_selector(selector, timeout=3000)
+                        if note_btn:
+                            await note_btn.click()
+                            await page.wait_for_timeout(1000)
+
+                            # Fill in the note
+                            note_field_selectors = [
+                                'textarea[name="message"]',
+                                'textarea#custom-message',
+                                'textarea[id*="connect"]',
+                                'textarea',
+                            ]
+                            for nf_selector in note_field_selectors:
+                                try:
+                                    textarea = await page.wait_for_selector(nf_selector, timeout=2000)
+                                    if textarea:
+                                        await textarea.fill(note)
+                                        note_added = True
+                                        ctx.info("Added personalized note")
+                                        break
+                                except Exception:
+                                    continue
+                            break
+                    except Exception:
+                        continue
+
+                if not note_added:
+                    ctx.info("Could not add note, sending without note")
+
+            # Click Send button
+            send_selectors = [
+                'button[aria-label*="Send"]',
+                'button[aria-label*="Odeslat"]',
+                'button:text-is("Send")',
+                'button:text-is("Odeslat")',
+                'button[aria-label*="Send invitation"]',
+                'button[aria-label*="Odeslat pozvánku"]',
+            ]
+
+            send_clicked = False
+            for selector in send_selectors:
+                try:
+                    send_btn = await page.wait_for_selector(selector, timeout=3000)
+                    if send_btn:
+                        await send_btn.click()
+                        send_clicked = True
+                        ctx.info("Sent connection request!")
+                        break
+                except Exception:
+                    continue
+
+            if not send_clicked:
+                # Sometimes the connect click directly sends without a dialog
+                ctx.info("No Send dialog found - connection request may have been sent directly")
+
+            await page.wait_for_timeout(2000)
+            report_progress(ctx, 90, 100, "Saving session...")
+            await session.save_session(page)
+            report_progress(ctx, 100, 100, "Done")
+
+            return {
+                "status": "success",
+                "message": f"Connection request sent to {profile_url}" + (" with note" if note else ""),
+                "profile_url": profile_url,
+                "note_included": bool(note)
+            }
+
+        except Exception as e:
+            ctx.error(f"Failed to send connection request: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Failed to send connection request: {str(e)}"
+            }
+
+
+@mcp.tool()
+async def filter_profile_viewers(
+    ctx: Context,
+    keywords: list[str] | None = None,
+    only_not_connected: bool = True,
+    count: int = 50
+) -> dict:
+    """Get profile viewers, filter by relevance (keywords in headline), and identify non-connections.
+
+    This tool combines viewing your profile visitors with filtering for relevant people
+    (e.g. AI, business owners, automation professionals) who are not yet in your connections.
+
+    Args:
+        ctx: MCP context for logging and progress reporting
+        keywords: Keywords to match in headline/title (default: AI, CEO, founder, owner, automation, CTO, podnikatel, majitel, zakladatel, automatizace, ředitel)
+        count: Maximum number of viewers to scan (default: 50)
+        only_not_connected: If True, only return viewers who are NOT connected (default: True)
+
+    Returns:
+        dict: Contains status, filtered viewers matching criteria, and summary stats
+    """
+    # Default keywords for AI, business owners, automation
+    if not keywords:
+        keywords = [
+            # English
+            'AI', 'artificial intelligence', 'machine learning', 'ML', 'GPT', 'LLM',
+            'CEO', 'CTO', 'COO', 'CMO', 'founder', 'co-founder', 'owner',
+            'director', 'managing director', 'president', 'partner',
+            'entrepreneur', 'business owner',
+            'automation', 'RPA', 'process automation',
+            # Czech
+            'umělá inteligence', 'strojové učení',
+            'zakladatel', 'spoluzakladatel', 'majitel', 'vlastník',
+            'ředitel', 'jednatel', 'podnikatel',
+            'automatizace', 'robotická automatizace',
+        ]
+
+    ctx.info(f"Fetching profile viewers (up to {count})...")
+
+    # Step 1: Get profile viewers
+    viewers_result = await get_profile_viewers(ctx=ctx, count=count)
+
+    if viewers_result.get("status") != "success":
+        return viewers_result
+
+    all_viewers = viewers_result.get("viewers", [])
+    ctx.info(f"Found {len(all_viewers)} profile viewer(s)")
+
+    # Step 2: Filter by keywords and connection status
+    filtered = []
+    keywords_lower = [kw.lower() for kw in keywords]
+
+    for viewer in all_viewers:
+        headline = (viewer.get("headline") or "").lower()
+        name = (viewer.get("name") or "").lower()
+        combined_text = f"{headline} {name}"
+
+        # Check keyword match
+        matched_keywords = [kw for kw in keywords_lower if kw in combined_text]
+        if not matched_keywords:
+            continue
+
+        # Check connection status if filtering
+        if only_not_connected:
+            degree = (viewer.get("connectionDegree") or "").strip()
+            # If it's 1st degree, they're already connected
+            if '1' in degree and ('st' in degree.lower() or '.' in degree):
+                continue
+
+        viewer_with_match = dict(viewer)
+        viewer_with_match["matched_keywords"] = matched_keywords
+        filtered.append(viewer_with_match)
+
+    ctx.info(f"Filtered to {len(filtered)} relevant non-connected viewer(s)")
+
+    return {
+        "status": "success",
+        "total_viewers": len(all_viewers),
+        "filtered_count": len(filtered),
+        "keywords_used": keywords,
+        "only_not_connected": only_not_connected,
+        "viewers": filtered,
+        "message": f"Found {len(filtered)} relevant viewer(s) out of {len(all_viewers)} total. "
+                   + ("Use send_connection_request tool to connect with them." if filtered else "No matching viewers found.")
+    }
+
+
 if __name__ == "__main__":
     try:
         logger.debug("Starting LinkedIn MCP Server with debug logging")
