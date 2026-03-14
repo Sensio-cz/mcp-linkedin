@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-linkedin"
+version = "0.2.0"
+description = "Internal research/prototype MCP server for LinkedIn browser automation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+    "fastmcp>=0.4.1",
+    "playwright==1.40.0",
+    "python-dotenv>=0.19.0",
+    "cryptography>=35.0.0",
+    "httpx>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+mcp-linkedin = "server:mcp.run"
+
+[tool.setuptools.packages.find]
+include = ["mcp_linkedin*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
